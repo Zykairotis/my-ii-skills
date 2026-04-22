@@ -15,7 +15,7 @@ author: mewtwo
 This skill gives you direct access to Parth's local PC (WSL2/Arch Linux) via SSH through a Pinggy tunnel. Use this to run commands, read files, manage processes, and interact with the development environment.
 
 ## Connection Details
-- **Tunnel URL**: `https://mwokk-49-36-19-226.run.pinggy-free.link`
+- **Tunnel URL**: `https://apmlt-49-36-19-226.run.pinggy-free.link`
 - **SSH Host**: `127.0.0.1`
 - **SSH User**: `mewtwo`
 - **SSH Port**: `22`
