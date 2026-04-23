@@ -26,6 +26,8 @@ Do not rely on MCP `ssh_download` or `ssh_upload` for hosted-agent round trips u
 
 Use the bundled scripts instead. They bridge file contents through `ssh_execute` in bounded chunks.
 
+Do not dump full file contents with raw `ssh_execute`, `remote_exec.py`, `cat`, or `base64`. Large stdout payloads can be truncated somewhere in the MCP, tunnel, or client chain. That failure can look like a normal successful read unless you chunk the transfer and verify the final checksum.
+
 ## First steps
 
 Ask the user for the current Pinggy base URL. The free tunnel changes every session. Example:
@@ -55,6 +57,8 @@ Use this for:
 - starting or checking tmux sessions
 - tiny edits only
 
+Do not use it to transfer full file contents.
+
 ### `scripts/pull_remote_file.py`
 
 Download a remote file from the PC into the agent environment.
@@ -65,6 +69,8 @@ python3 scripts/pull_remote_file.py \
 ```
 
 By default it writes to a workspace scratch path and creates a sidecar metadata file next to the pulled file. Today that scratch path is implemented as a temp directory unless the agent passes `--local-path` explicitly. The metadata lets `push_remote_file.py` verify that the remote file has not changed unexpectedly before replacing it.
+
+This script is safe for large files because it reads the remote file in small chunks and verifies the assembled local file checksum against the remote checksum before returning success.
 
 Useful flags:
 
@@ -93,6 +99,32 @@ If the pull metadata sidecar exists, the script will:
 - upload via a temp file
 - atomically replace the target
 - create a backup by default
+
+It also verifies the fully assembled remote file checksum after upload and before reporting success.
+
+## Programmatic use
+
+If you are writing custom Python around the bridge, use these methods instead of raw file-dump commands:
+
+```python
+from mcp_bridge import McpBridge
+
+bridge = McpBridge(base_url="https://example.run.pinggy.link")
+content = bridge.read_remote_text_file("/mnt/wsl/fastssd/myproject/app.ts")
+bridge.upload_remote_file_atomic(
+    "/workspace/app.ts",
+    "/mnt/wsl/fastssd/myproject/app.ts",
+    expected_remote_sha256="...",
+)
+```
+
+Avoid this pattern:
+
+```python
+bridge.ssh_execute(f"cat {remote_path}")
+```
+
+`McpBridge.ssh_execute()` now rejects obvious raw file-dump commands and points callers at the safe helpers.
 
 Useful flags:
 

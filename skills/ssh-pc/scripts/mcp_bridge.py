@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import base64
 import json
 import os
+import re
 import shlex
 import sys
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +19,110 @@ CLIENT_NAME = "ssh-pc-skill"
 CLIENT_VERSION = "2.0.0"
 DEFAULT_SERVER = "mypc"
 DEFAULT_TIMEOUT = 60
+DEFAULT_FILE_CHUNK_BYTES = 4096
+UNSAFE_FILE_DUMP_RE = re.compile(r"^\s*(?:cat|base64)\s+\S+\s*$")
+
+REMOTE_FILE_STAT_SCRIPT = r"""
+import hashlib, json, pathlib, sys
+
+path = pathlib.Path(sys.argv[1]).expanduser()
+if not path.exists():
+    print(json.dumps({"exists": False, "path": str(path)}))
+    raise SystemExit(0)
+
+stat = path.stat()
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+
+print(json.dumps({
+    "exists": True,
+    "path": str(path),
+    "size": stat.st_size,
+    "mode": format(stat.st_mode & 0o777, "04o"),
+    "sha256": digest.hexdigest(),
+}))
+"""
+
+REMOTE_FILE_CHUNK_SCRIPT = r"""
+import base64, json, pathlib, sys
+
+path = pathlib.Path(sys.argv[1]).expanduser()
+offset = int(sys.argv[2])
+chunk_size = int(sys.argv[3])
+
+with path.open("rb") as handle:
+    handle.seek(offset)
+    data = handle.read(chunk_size)
+
+print(json.dumps({
+    "offset": offset,
+    "count": len(data),
+    "data_b64": base64.b64encode(data).decode("ascii"),
+}))
+"""
+
+REMOTE_APPEND_B64_SCRIPT = r"""
+import pathlib, sys
+
+path = pathlib.Path(sys.argv[1]).expanduser()
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("ab") as handle:
+    handle.write(sys.argv[2].encode("ascii"))
+"""
+
+REMOTE_DECODE_SCRIPT = r"""
+import base64, hashlib, json, os, pathlib, sys
+
+b64_path = pathlib.Path(sys.argv[1]).expanduser()
+tmp_file = pathlib.Path(sys.argv[2]).expanduser()
+mode = sys.argv[3]
+
+data = base64.b64decode(b64_path.read_bytes())
+tmp_file.parent.mkdir(parents=True, exist_ok=True)
+tmp_file.write_bytes(data)
+if mode:
+    os.chmod(tmp_file, int(mode, 8))
+
+print(json.dumps({
+    "tmp_file": str(tmp_file),
+    "size": len(data),
+    "sha256": hashlib.sha256(data).hexdigest(),
+}))
+"""
+
+REMOTE_FINALIZE_SCRIPT = r"""
+import json, os, pathlib, shutil, sys
+
+tmp_file = pathlib.Path(sys.argv[1]).expanduser()
+target = pathlib.Path(sys.argv[2]).expanduser()
+backup_path = sys.argv[3]
+
+target.parent.mkdir(parents=True, exist_ok=True)
+if backup_path and target.exists():
+    backup = pathlib.Path(backup_path).expanduser()
+    backup.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(target, backup)
+
+os.replace(tmp_file, target)
+print(json.dumps({
+    "target": str(target),
+    "backup_path": backup_path or None,
+}))
+"""
+
+REMOTE_CLEANUP_SCRIPT = r"""
+import pathlib, sys
+
+for raw_path in sys.argv[1:]:
+    path = pathlib.Path(raw_path).expanduser()
+    try:
+        if path.exists():
+            path.unlink()
+    except FileNotFoundError:
+        pass
+"""
 
 
 def normalize_base_url(value: str | None) -> str:
@@ -42,6 +150,16 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def sha256_bytes(data: bytes) -> str:
+    import hashlib
+
+    return hashlib.sha256(data).hexdigest()
+
+
+def looks_like_unsafe_file_dump(command: str) -> bool:
+    return bool(UNSAFE_FILE_DUMP_RE.match(command))
 
 
 def _parse_http_payload(raw_body: bytes) -> Any:
@@ -184,7 +302,14 @@ class McpBridge:
             raise RuntimeError(f"Unexpected tool result payload: {response!r}")
         return result
 
-    def ssh_execute(self, command: str, *, cwd: str | None = None) -> dict[str, Any]:
+    def ssh_execute(self, command: str, *, cwd: str | None = None, allow_unsafe_file_dump: bool = False) -> dict[str, Any]:
+        if not allow_unsafe_file_dump and looks_like_unsafe_file_dump(command):
+            raise RuntimeError(
+                "Refusing to stream full file contents through ssh_execute.\n"
+                "Use McpBridge.download_remote_file(), McpBridge.read_remote_text_file(),\n"
+                "or scripts/pull_remote_file.py instead."
+            )
+
         args: dict[str, Any] = {"server": self.server, "command": command}
         if cwd:
             args["cwd"] = cwd
@@ -200,6 +325,197 @@ class McpBridge:
         if not isinstance(parsed, dict):
             raise RuntimeError(f"Unexpected ssh_execute payload: {parsed!r}")
         return parsed
+
+    def remote_file_stat(self, remote_path: str) -> dict[str, Any]:
+        return run_remote_python_json(self, REMOTE_FILE_STAT_SCRIPT, remote_path)
+
+    def download_remote_file(
+        self,
+        remote_path: str,
+        local_path: str | Path,
+        *,
+        chunk_bytes: int = DEFAULT_FILE_CHUNK_BYTES,
+    ) -> dict[str, Any]:
+        destination = Path(local_path).expanduser()
+        remote_meta = self.remote_file_stat(remote_path)
+
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with destination.open("wb") as handle:
+            offset = 0
+            while offset < int(remote_meta["size"]):
+                chunk = run_remote_python_json(
+                    self,
+                    REMOTE_FILE_CHUNK_SCRIPT,
+                    remote_path,
+                    offset,
+                    chunk_bytes,
+                )
+                count = int(chunk["count"])
+                if count <= 0:
+                    raise RuntimeError(f"Remote transfer stalled at offset {offset}.")
+                handle.write(base64.b64decode(chunk["data_b64"]))
+                offset += count
+
+        local_sha256 = sha256_file(destination)
+        if local_sha256 != remote_meta["sha256"]:
+            raise RuntimeError(
+                "Checksum mismatch after download.\n"
+                f"Remote: {remote_meta['sha256']}\n"
+                f"Local:  {local_sha256}"
+            )
+
+        return {
+            "local_path": str(destination),
+            "remote_path": remote_meta["path"],
+            "sha256": remote_meta["sha256"],
+            "size": remote_meta["size"],
+            "mode": remote_meta["mode"],
+            "exists": remote_meta["exists"],
+            "chunk_bytes": chunk_bytes,
+        }
+
+    def read_remote_file_bytes(
+        self,
+        remote_path: str,
+        *,
+        chunk_bytes: int = DEFAULT_FILE_CHUNK_BYTES,
+    ) -> bytes:
+        remote_meta = self.remote_file_stat(remote_path)
+        data = bytearray()
+        offset = 0
+        while offset < int(remote_meta["size"]):
+            chunk = run_remote_python_json(
+                self,
+                REMOTE_FILE_CHUNK_SCRIPT,
+                remote_path,
+                offset,
+                chunk_bytes,
+            )
+            count = int(chunk["count"])
+            if count <= 0:
+                raise RuntimeError(f"Remote transfer stalled at offset {offset}.")
+            data.extend(base64.b64decode(chunk["data_b64"]))
+            offset += count
+
+        payload = bytes(data)
+        local_sha256 = sha256_bytes(payload)
+        if local_sha256 != remote_meta["sha256"]:
+            raise RuntimeError(
+                "Checksum mismatch after download.\n"
+                f"Remote: {remote_meta['sha256']}\n"
+                f"Local:  {local_sha256}"
+            )
+        return payload
+
+    def read_remote_text_file(
+        self,
+        remote_path: str,
+        *,
+        encoding: str = "utf-8",
+        chunk_bytes: int = DEFAULT_FILE_CHUNK_BYTES,
+    ) -> str:
+        return self.read_remote_file_bytes(remote_path, chunk_bytes=chunk_bytes).decode(encoding)
+
+    def upload_remote_file_atomic(
+        self,
+        local_path: str | Path,
+        remote_path: str,
+        *,
+        expected_remote_sha256: str | None = None,
+        remote_mode: str | None = None,
+        chunk_bytes: int = DEFAULT_FILE_CHUNK_BYTES,
+        force: bool = False,
+        backup: bool = True,
+    ) -> dict[str, Any]:
+        source = Path(local_path).expanduser()
+        if not source.is_file():
+            raise RuntimeError(f"Local path is not a file: {source}")
+
+        local_sha256 = sha256_file(source)
+        remote_before = self.remote_file_stat(remote_path)
+        if (
+            not force
+            and expected_remote_sha256
+            and remote_before.get("exists")
+            and remote_before.get("sha256") != expected_remote_sha256
+        ):
+            raise RuntimeError(
+                "Remote file changed since pull. Refusing to overwrite.\n"
+                f"Expected: {expected_remote_sha256}\n"
+                f"Actual:   {remote_before.get('sha256')}\n"
+                "Pass --force to override."
+            )
+
+        token = uuid.uuid4().hex[:12]
+        target_name = Path(remote_path).name or "remote-file"
+        remote_tmp_root = Path("/tmp/ssh-pc-bridge")
+        remote_tmp_b64 = remote_tmp_root / f"{token}.b64"
+        remote_tmp_file = remote_tmp_root / f"{token}.{target_name}"
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = f"{remote_path}.bak.{timestamp}" if backup else ""
+
+        try:
+            self.ssh_execute(build_remote_python_command(REMOTE_CLEANUP_SCRIPT, str(remote_tmp_b64), str(remote_tmp_file)))
+
+            with source.open("rb") as handle:
+                while True:
+                    chunk = handle.read(chunk_bytes)
+                    if not chunk:
+                        break
+                    chunk_b64 = base64.b64encode(chunk).decode("ascii")
+                    result = self.ssh_execute(
+                        build_remote_python_command(REMOTE_APPEND_B64_SCRIPT, str(remote_tmp_b64), chunk_b64)
+                    )
+                    if result.get("code") != 0:
+                        raise RuntimeError(
+                            "Failed to append upload chunk.\n"
+                            f"stdout:\n{result.get('stdout', '')}\n"
+                            f"stderr:\n{result.get('stderr', '')}"
+                        )
+
+            decoded = run_remote_python_json(
+                self,
+                REMOTE_DECODE_SCRIPT,
+                str(remote_tmp_b64),
+                str(remote_tmp_file),
+                remote_mode or "",
+            )
+            if decoded.get("sha256") != local_sha256:
+                raise RuntimeError(
+                    "Checksum mismatch after remote staging.\n"
+                    f"Local:   {local_sha256}\n"
+                    f"Remote:  {decoded.get('sha256')}"
+                )
+
+            finalized = run_remote_python_json(
+                self,
+                REMOTE_FINALIZE_SCRIPT,
+                str(remote_tmp_file),
+                remote_path,
+                backup_path,
+            )
+            remote_after = self.remote_file_stat(remote_path)
+            if remote_after.get("sha256") != local_sha256:
+                raise RuntimeError(
+                    "Checksum mismatch after remote replace.\n"
+                    f"Local:   {local_sha256}\n"
+                    f"Remote:  {remote_after.get('sha256')}"
+                )
+        finally:
+            try:
+                self.ssh_execute(build_remote_python_command(REMOTE_CLEANUP_SCRIPT, str(remote_tmp_b64), str(remote_tmp_file)))
+            except RuntimeError:
+                pass
+
+        return {
+            "local_path": str(source),
+            "remote_path": remote_path,
+            "sha256": local_sha256,
+            "backup_path": finalized.get("backup_path"),
+            "remote_mode": remote_after.get("mode", remote_mode),
+            "remote_size": remote_after.get("size"),
+            "previous_sha256": remote_before.get("sha256"),
+        }
 
 
 def run_remote_python_json(bridge: McpBridge, script: str, *args: object, cwd: str | None = None) -> dict[str, Any]:
