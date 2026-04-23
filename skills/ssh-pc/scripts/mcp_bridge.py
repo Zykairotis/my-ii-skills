@@ -28,7 +28,9 @@ def normalize_base_url(value: str | None) -> str:
 
 
 def build_remote_python_command(script: str, *args: object) -> str:
-    parts = ["python3", "-c", script, "--", *[str(arg) for arg in args]]
+    # Do not inject "--" here. In `python -c`, CPython includes that literal
+    # separator in sys.argv, which shifts the real arguments by one position.
+    parts = ["python3", "-c", script, *[str(arg) for arg in args]]
     return " ".join(shlex.quote(part) for part in parts)
 
 

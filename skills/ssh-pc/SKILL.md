@@ -1,6 +1,6 @@
 ---
 name: ssh-pc
-description: Bridge a hosted agent to Parth's PC over MCP SSH Manager via Pinggy. Use when work must run against the PC's shell or filesystem, especially when the agent needs to pull files into its own temp workspace, edit locally, and push them back atomically.
+description: Bridge a hosted agent to Parth's PC over MCP SSH Manager via Pinggy. Use when work must run against the PC's shell or filesystem, especially when the agent needs to pull files into its own workspace, edit locally, and push them back atomically.
 ---
 
 # SSH PC
@@ -16,7 +16,7 @@ This skill is designed around a split environment:
 For that reason, prefer a round-trip workflow:
 
 1. Inspect on the PC.
-2. Pull the target file into the agent's temp workspace.
+2. Pull the target file into the agent's workspace.
 3. Edit it locally with the agent's normal tools.
 4. Push it back with atomic replace and optional backup.
 
@@ -64,7 +64,7 @@ python3 scripts/pull_remote_file.py \
   --remote-path /mnt/wsl/fastssd/myproject/src/app.ts
 ```
 
-By default it writes to a temp directory and creates a sidecar metadata file next to the pulled file. That metadata lets `push_remote_file.py` verify that the remote file has not changed unexpectedly before replacing it.
+By default it writes to a workspace scratch path and creates a sidecar metadata file next to the pulled file. Today that scratch path is implemented as a temp directory unless the agent passes `--local-path` explicitly. The metadata lets `push_remote_file.py` verify that the remote file has not changed unexpectedly before replacing it.
 
 Useful flags:
 
