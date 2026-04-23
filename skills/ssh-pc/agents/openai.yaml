@@ -1,0 +1,7 @@
+interface:
+  display_name: "SSH PC Bridge"
+  short_description: "Bridge a hosted agent to Parth's PC safely"
+  default_prompt: "Use $ssh-pc to inspect my PC over MCP, pull files into a temp workspace, edit them locally, and push them back atomically."
+
+policy:
+  allow_implicit_invocation: true

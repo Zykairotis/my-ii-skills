@@ -1,317 +1,176 @@
 ---
-name: SSH PC Access
-version: 1.2.0
-description: |
-  Access Parth's local PC (Arch Linux on WSL2) remotely via MCP SSH Manager over a Pinggy tunnel.
-  Use when you need to run shell commands, manage tmux sessions, read/write files, inspect processes,
-  work with Docker, or interact with the development environment from outside the machine.
-  Also loads local agent skills from ~/.agents/skills on the remote PC.
-author: mewtwo
+name: ssh-pc
+description: Bridge a hosted agent to Parth's PC over MCP SSH Manager via Pinggy. Use when work must run against the PC's shell or filesystem, especially when the agent needs to pull files into its own temp workspace, edit locally, and push them back atomically.
 ---
 
-# SSH PC Access Skill
+# SSH PC
 
-## Overview
+Use this skill when the agent is running in a hosted sandbox but the real work must happen on Parth's PC.
 
-This skill connects you to Parth's local PC through **MCP SSH Manager** exposed via a **Pinggy tunnel** (Streamable HTTP MCP transport).
+This skill is designed around a split environment:
 
-You can:
-- Run arbitrary shell commands and scripts
-- Create and attach to **tmux sessions** for long-running work
-- Read, write, and inspect files
-- Manage processes, Docker containers, and services
-- Work inside the development directories
-- Load and use additional skills from `~/.agents/skills` on the remote PC
+- The agent has its own filesystem and editor.
+- The MCP SSH server runs on Parth's PC.
+- Direct remote edits are fragile for large changes.
 
----
+For that reason, prefer a round-trip workflow:
 
-## Step 0 — Load local skills on the remote PC
+1. Inspect on the PC.
+2. Pull the target file into the agent's temp workspace.
+3. Edit it locally with the agent's normal tools.
+4. Push it back with atomic replace and optional backup.
 
-The remote PC has a skills folder at:
+## Important constraint
 
-```
-~/.agents/skills/
-```
+Do not rely on MCP `ssh_download` or `ssh_upload` for hosted-agent round trips unless the agent and Parth's PC share the same filesystem. Those tools resolve `localPath` on the machine running the MCP server, not inside the hosted agent sandbox.
 
-Before starting work, list what's available:
+Use the bundled scripts instead. They bridge file contents through `ssh_execute` in bounded chunks.
 
-```bash
-ls ~/.agents/skills/
-```
+## First steps
 
-Each subfolder is a skill. Read its `SKILL.md` to understand what it does and whether it's relevant to the current task. Incorporate those skills into your approach as needed.
-
----
-
-## Step 1 — Get the tunnel URL
-
-The Pinggy free tunnel changes every session and expires every ~60 minutes.
-
-**Always ask the user for the current base URL before connecting**, for example:
-- `https://apmlt-49-36-19-226.run.pinggy-free.link`
-
-Once you have it, the MCP endpoint is:
-```
-<BASE_URL>/mcp
-```
-
----
-
-## Step 2 — Initialize the MCP session
-
-POST to `<BASE_URL>/mcp`:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "initialize",
-  "params": {
-    "protocolVersion": "2025-03-26",
-    "capabilities": {},
-    "clientInfo": { "name": "ssh-pc-skill", "version": "1.2.0" }
-  }
-}
-```
-
-Save the `Mcp-Session-Id` from the response headers and include it in all subsequent requests.
-
-Optionally confirm available tools:
-
-```json
-{ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }
-```
-
----
-
-## Step 3 — Run commands with `ssh_execute`
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 3,
-  "method": "tools/call",
-  "params": {
-    "name": "ssh_execute",
-    "arguments": {
-      "server": "mypc",
-      "command": "YOUR_COMMAND_HERE",
-      "timeout": 15000
-    }
-  }
-}
-```
-
-- `server` is always `"mypc"` unless the user says otherwise.
-- `timeout` is in milliseconds. Increase for long-running commands.
-- If PATH is limited, use absolute binary paths (see below).
-
----
-
-## tmux — Long-running and persistent sessions
-
-Use tmux for anything that takes more than a few seconds, or when you want to keep a process running after the command returns.
-
-### Create a new named session
-```bash
-tmux new-session -d -s work
-```
-
-### Run a command inside a tmux session
-```bash
-tmux send-keys -t work "npm run dev" Enter
-```
-
-### List active sessions
-```bash
-tmux ls
-```
-
-### Capture output from a session
-```bash
-tmux capture-pane -pt work -S -100
-```
-
-### Kill a session
-```bash
-tmux kill-session -t work
-```
-
-### Run a long command and detach immediately
-```bash
-tmux new-session -d -s build -x 220 -y 50 \; send-keys "cd /mnt/wsl/fastssd/myproject && npm run build" Enter
-```
-
-Use tmux whenever:
-- Starting dev servers (`npm run dev`, `python app.py`, etc.)
-- Running builds or tests that take time
-- You want output to persist for later inspection
-
----
-
-## Bash scripting on the remote PC
-
-You can send multi-line bash scripts as a single command:
+Ask the user for the current Pinggy base URL. The free tunnel changes every session. Example:
 
 ```bash
-bash -c '
-  cd /mnt/wsl/fastssd/myproject
-  git pull
-  npm install
-  npm run build
-'
+export SSH_PC_BASE_URL="https://apmlt-49-36-19-226.run.pinggy-free.link"
+export SSH_PC_SERVER="mypc"
 ```
 
-Or write a script file and execute it:
+`SSH_PC_BASE_URL` may be either the base URL or the full `/mcp` URL. The scripts normalize it automatically.
+
+## Available helper scripts
+
+### `scripts/remote_exec.py`
+
+Run a command on the PC.
 
 ```bash
-cat > /tmp/setup.sh << 'EOF'
-#!/usr/bin/env bash
-set -e
-cd /mnt/wsl/fastssd/myproject
-npm install
-npm run dev &
-echo "Dev server started"
-EOF
-bash /tmp/setup.sh
+python3 scripts/remote_exec.py --command 'pwd && git status --short'
+python3 scripts/remote_exec.py --cwd /mnt/wsl/fastssd/myproject --command 'npm test'
 ```
 
----
+Use this for:
 
-## Common Tasks
+- inspection
+- git status and logs
+- starting or checking tmux sessions
+- tiny edits only
 
-### System status
+### `scripts/pull_remote_file.py`
+
+Download a remote file from the PC into the agent environment.
+
 ```bash
-whoami && /usr/bin/uname -a && /usr/bin/uptime && free -h && df -h /
+python3 scripts/pull_remote_file.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts
 ```
 
-### List project files
+By default it writes to a temp directory and creates a sidecar metadata file next to the pulled file. That metadata lets `push_remote_file.py` verify that the remote file has not changed unexpectedly before replacing it.
+
+Useful flags:
+
 ```bash
-ls -la /mnt/wsl/fastssd/
+python3 scripts/pull_remote_file.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --local-path /tmp/app.ts
+
+python3 scripts/pull_remote_file.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --print-local-path
 ```
 
-### Check running processes
+### `scripts/push_remote_file.py`
+
+Upload a locally edited file back to the PC.
+
 ```bash
-ps aux --sort=-%cpu | head -20
+python3 scripts/push_remote_file.py --local-path /tmp/app.ts
 ```
 
-### Check Docker containers
+If the pull metadata sidecar exists, the script will:
+
+- infer the original remote path
+- verify the remote file still matches the pulled checksum
+- upload via a temp file
+- atomically replace the target
+- create a backup by default
+
+Useful flags:
+
 ```bash
-docker ps
+python3 scripts/push_remote_file.py \
+  --local-path /tmp/app.ts \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts
+
+python3 scripts/push_remote_file.py \
+  --local-path /tmp/app.ts \
+  --force \
+  --no-backup
 ```
 
-### Check Docker logs
+## Default workflow for real edits
+
+For any non-trivial file change, use this exact sequence:
+
+1. Inspect:
+
 ```bash
-docker logs --tail 50 <container_name>
+python3 scripts/remote_exec.py \
+  --cwd /mnt/wsl/fastssd/myproject \
+  --command 'git status --short && sed -n "1,220p" src/app.ts'
 ```
 
-### Read a file
+2. Pull:
+
 ```bash
-cat /path/to/file
+python3 scripts/pull_remote_file.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts
 ```
 
-### Write a file
+3. Edit the pulled local file with the agent's normal coding workflow.
+
+4. Push:
+
 ```bash
-cat > /path/to/file << 'EOF'
-file content here
-EOF
+python3 scripts/push_remote_file.py --local-path /tmp/whatever/app.ts
 ```
 
-### Check open ports
+5. Verify remotely:
+
 ```bash
-ss -tlnp
+python3 scripts/remote_exec.py \
+  --cwd /mnt/wsl/fastssd/myproject \
+  --command 'git diff -- src/app.ts && npm test -- --runInBand'
 ```
 
-### Check systemd service
+## When to choose which path
+
+- Use direct remote commands for inspection and tiny one-line changes.
+- Use pull/edit/push for multi-line edits, formatted code, generated files, structured configs, or anything where local tooling is safer.
+- Use tmux for long-running processes or servers.
+
+## Remote skills on the PC
+
+The PC also has local skills under `~/.agents/skills/`. If the task happens on the PC itself, inspect those before doing work:
+
 ```bash
-systemctl status <service>
+python3 scripts/remote_exec.py --command 'ls ~/.agents/skills'
 ```
 
-### Git status in a project
+Read the relevant remote `SKILL.md` files with `remote_exec.py` before using them.
+
+## tmux examples
+
 ```bash
-cd /mnt/wsl/fastssd/myproject && git status && git log --oneline -5
+python3 scripts/remote_exec.py --command 'tmux ls'
+python3 scripts/remote_exec.py --command 'tmux new-session -d -s work'
+python3 scripts/remote_exec.py --command 'tmux send-keys -t work "cd /mnt/wsl/fastssd/myproject && npm run dev" Enter'
+python3 scripts/remote_exec.py --command 'tmux capture-pane -pt work -S -120'
 ```
 
----
+## Environment details
 
-## Environment Details
-
-| Property | Value |
-|---|---|
-| OS | Arch Linux (WSL2 on Windows) |
-| SSH User | `mewtwo` |
-| SSH Host | `127.0.0.1` |
-| SSH Port | `22` |
-| MCP server port | `3999` (local) |
-| MCP transport | Streamable HTTP (`/mcp`) |
-| Primary server name | `mypc` |
-
----
-
-## Key Paths
-
-| Path | Purpose |
-|---|---|
-| `/home/mewtwo/` | Home directory |
-| `/mnt/wsl/fastssd/` | Main workspace (fast SSD) |
-| `/mnt/wsl/fastssd/mcp-ssh-manager/` | MCP SSH Manager project |
-| `/home/mewtwo/.ssh-mcp-config.toml` | SSH server config |
-| `/home/mewtwo/.agents/skills/` | Local agent skills |
-| `/mnt/c/Users/XMewtwoX/` | Windows user directory (via WSL) |
-| `/mnt/c/Users/XMewtwoX/my-ii-skills/` | Skills repo (Windows-mounted) |
-
----
-
-## Absolute Binary Paths (when PATH is limited)
-
-If commands fail with "not found", use explicit paths:
-
-```
-/usr/bin/bash
-/usr/bin/uname
-/usr/bin/uptime
-/usr/bin/ls
-/usr/bin/cat
-/usr/bin/ps
-/usr/bin/grep
-/usr/bin/find
-/usr/bin/git
-/usr/bin/docker
-/usr/bin/tmux
-/usr/bin/python3
-/usr/bin/node
-/usr/local/bin/node
-```
-
----
-
-## Safety Rules
-
-Always confirm with the user before:
-- `rm` on important paths
-- `shutdown` or `reboot`
-- Restarting services that affect active work
-- Database restore or destructive migrations
-- `git reset --hard` or `git clean -f`
-
-Default to read-only inspection first. Write only when the user asks.
-
----
-
-## Failure Handling
-
-| Symptom | Action |
-|---|---|
-| Endpoint unreachable | Ask user to restart Pinggy and provide new URL |
-| `initialize` succeeds but tools fail | Call `tools/list` to verify tool names |
-| Command not found | Retry with absolute binary path |
-| Timeout | Increase `timeout` value or use tmux for long commands |
-| Session expired | Re-initialize with a new `initialize` request |
-
----
-
-## Notes
-
-- Transport is **Streamable HTTP MCP** — do not use `/sse` or `/message` endpoints.
-- Tunnel URL is always runtime input — never hardcode it.
-- Always check `~/.agents/skills/` for local skills that may extend what you can do on this machine.
+- Remote OS: Arch Linux on WSL2
+- Remote user: `mewtwo`
+- Primary server name: `mypc`
+- Main workspace: `/mnt/wsl/fastssd/`
+- Remote skills: `/home/mewtwo/.agents/skills/`
