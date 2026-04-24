@@ -124,6 +124,201 @@ for raw_path in sys.argv[1:]:
         pass
 """
 
+REMOTE_READ_LINES_SCRIPT = r"""
+import hashlib, json, pathlib, sys
+
+path = pathlib.Path(sys.argv[1]).expanduser()
+if not path.exists():
+    print(json.dumps({"exists": False, "path": str(path)}))
+    raise SystemExit(0)
+
+start = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2] else 1
+end = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else None
+
+with path.open("r", encoding="utf-8") as handle:
+    lines = handle.readlines()
+
+total = len(lines)
+start_idx = max(0, start - 1)
+end_idx = min(total, end) if end is not None else total
+
+result_lines = []
+for i in range(start_idx, end_idx):
+    result_lines.append({"num": i + 1, "text": lines[i].rstrip("\n").rstrip("\r")})
+
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+
+print(json.dumps({
+    "exists": True,
+    "path": str(path),
+    "total_lines": total,
+    "start": start_idx + 1,
+    "end": end_idx,
+    "lines": result_lines,
+    "sha256": digest.hexdigest(),
+}))
+"""
+
+REMOTE_REPLACE_LINES_SCRIPT = r"""
+import base64, hashlib, json, os, pathlib, shutil, sys
+from datetime import datetime, timezone
+
+path = pathlib.Path(sys.argv[1]).expanduser()
+start = int(sys.argv[2])
+end = int(sys.argv[3])
+new_text_b64 = sys.argv[4]
+backup = sys.argv[5].lower() == "true" if len(sys.argv) > 5 else True
+
+new_text = base64.b64decode(new_text_b64).decode("utf-8")
+new_lines = new_text.split("\n") if new_text else []
+
+with path.open("r", encoding="utf-8") as handle:
+    lines = handle.readlines()
+
+total = len(lines)
+start_idx = max(0, start - 1)
+end_idx = min(total, end)
+
+prev_digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        prev_digest.update(chunk)
+
+result_lines = lines[:start_idx] + [l + "\n" for l in new_lines] + lines[end_idx:]
+content = "".join(result_lines)
+new_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+backup_path = ""
+if backup and path.exists():
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = str(path) + ".bak." + ts
+    shutil.copy2(path, pathlib.Path(backup_path))
+
+tmp = pathlib.Path(str(path) + ".tmp." + os.urandom(4).hex())
+tmp.write_text(content, encoding="utf-8")
+if path.exists():
+    os.chmod(tmp, path.stat().st_mode & 0o777)
+os.replace(tmp, path)
+
+print(json.dumps({
+    "path": str(path),
+    "replaced_lines": end_idx - start_idx,
+    "new_line_count": len(new_lines),
+    "total_lines": len(result_lines),
+    "sha256": new_sha256,
+    "backup_path": backup_path,
+    "previous_sha256": prev_digest.hexdigest(),
+}))
+"""
+
+REMOTE_INSERT_LINES_SCRIPT = r"""
+import base64, hashlib, json, os, pathlib, shutil, sys
+from datetime import datetime, timezone
+
+path = pathlib.Path(sys.argv[1]).expanduser()
+at_line = int(sys.argv[2])
+new_text_b64 = sys.argv[3]
+position = sys.argv[4] if len(sys.argv) > 4 else "after"
+backup = sys.argv[5].lower() == "true" if len(sys.argv) > 5 else True
+
+new_text = base64.b64decode(new_text_b64).decode("utf-8")
+new_lines = new_text.split("\n") if new_text else []
+
+with path.open("r", encoding="utf-8") as handle:
+    lines = handle.readlines()
+
+total = len(lines)
+insert_idx = max(0, at_line) if position == "after" else max(0, at_line - 1)
+
+prev_digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        prev_digest.update(chunk)
+
+result_lines = lines[:insert_idx] + [l + "\n" for l in new_lines] + lines[insert_idx:]
+content = "".join(result_lines)
+new_sha256 = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+backup_path = ""
+if backup and path.exists():
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup_path = str(path) + ".bak." + ts
+    shutil.copy2(path, pathlib.Path(backup_path))
+
+tmp = pathlib.Path(str(path) + ".tmp." + os.urandom(4).hex())
+tmp.write_text(content, encoding="utf-8")
+if path.exists():
+    os.chmod(tmp, path.stat().st_mode & 0o777)
+os.replace(tmp, path)
+
+print(json.dumps({
+    "path": str(path),
+    "inserted_at_line": at_line,
+    "position": position,
+    "new_line_count": len(new_lines),
+    "total_lines": len(result_lines),
+    "sha256": new_sha256,
+    "backup_path": backup_path,
+    "previous_sha256": prev_digest.hexdigest(),
+}))
+"""
+
+REMOTE_FILE_SEARCH_SCRIPT = r"""
+import hashlib, json, pathlib, re, sys
+
+path = pathlib.Path(sys.argv[1]).expanduser()
+pattern = sys.argv[2]
+context = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3] else 2
+max_matches = int(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else 20
+
+if not path.exists():
+    print(json.dumps({"exists": False, "path": str(path)}))
+    raise SystemExit(0)
+
+with path.open("r", encoding="utf-8") as handle:
+    text = handle.read()
+    lines = text.splitlines()
+
+compiled = re.compile(pattern)
+count = 0
+matches = []
+
+for match in compiled.finditer(text):
+    count += 1
+    if len(matches) >= max_matches:
+        continue
+    line_num = text[:match.start()].count("\n") + 1
+    line_idx = line_num - 1
+    start_ctx = max(0, line_idx - context)
+    end_ctx = min(len(lines), line_idx + context + 1)
+    ctx_before = [{"num": i + 1, "text": lines[i]} for i in range(start_ctx, line_idx)]
+    ctx_after = [{"num": i + 1, "text": lines[i]} for i in range(line_idx + 1, end_ctx)]
+    matches.append({
+        "line": line_num,
+        "text": lines[line_idx] if line_idx < len(lines) else "",
+        "context_before": ctx_before,
+        "context_after": ctx_after,
+    })
+
+digest = hashlib.sha256()
+with path.open("rb") as handle:
+    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+        digest.update(chunk)
+
+print(json.dumps({
+    "exists": True,
+    "path": str(path),
+    "pattern": pattern,
+    "count": count,
+    "returned": len(matches),
+    "matches": matches,
+    "sha256": digest.hexdigest(),
+}))
+"""
+
 
 def normalize_base_url(value: str | None) -> str:
     if not value:
@@ -516,6 +711,127 @@ class McpBridge:
             "remote_size": remote_after.get("size"),
             "previous_sha256": remote_before.get("sha256"),
         }
+
+    def read_lines(
+        self,
+        remote_path: str,
+        start: int | None = None,
+        end: int | None = None,
+    ) -> dict[str, Any]:
+        return run_remote_python_json(
+            self,
+            REMOTE_READ_LINES_SCRIPT,
+            remote_path,
+            start if start is not None else "",
+            end if end is not None else "",
+        )
+
+    def replace_lines(
+        self,
+        remote_path: str,
+        start: int,
+        end: int,
+        new_text: str,
+        *,
+        backup: bool = True,
+        expected_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        if expected_sha256:
+            current = self.remote_file_stat(remote_path)
+            if current.get("sha256") != expected_sha256:
+                raise RuntimeError(
+                    "Remote file changed since last read. Refusing to edit.\n"
+                    f"Expected: {expected_sha256}\n"
+                    f"Actual:   {current.get('sha256')}"
+                )
+
+        new_text_b64 = base64.b64encode(new_text.encode("utf-8")).decode("ascii")
+        if len(new_text_b64) > 8192:
+            raise RuntimeError(
+                "Replacement text too large for line-level edit.\n"
+                f"Size: {len(new_text_b64)} bytes base64.\n"
+                "Use pull_remote_file.py + edit locally + push_remote_file.py instead."
+            )
+
+        return run_remote_python_json(
+            self,
+            REMOTE_REPLACE_LINES_SCRIPT,
+            remote_path,
+            start,
+            end,
+            new_text_b64,
+            "true" if backup else "false",
+        )
+
+    def insert_lines(
+        self,
+        remote_path: str,
+        at_line: int,
+        new_text: str,
+        *,
+        position: str = "after",
+        backup: bool = True,
+        expected_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        if expected_sha256:
+            current = self.remote_file_stat(remote_path)
+            if current.get("sha256") != expected_sha256:
+                raise RuntimeError(
+                    "Remote file changed since last read. Refusing to edit.\n"
+                    f"Expected: {expected_sha256}\n"
+                    f"Actual:   {current.get('sha256')}"
+                )
+
+        new_text_b64 = base64.b64encode(new_text.encode("utf-8")).decode("ascii")
+        if len(new_text_b64) > 8192:
+            raise RuntimeError(
+                "Insert text too large for line-level edit.\n"
+                f"Size: {len(new_text_b64)} bytes base64.\n"
+                "Use pull_remote_file.py + edit locally + push_remote_file.py instead."
+            )
+
+        return run_remote_python_json(
+            self,
+            REMOTE_INSERT_LINES_SCRIPT,
+            remote_path,
+            at_line,
+            new_text_b64,
+            position,
+            "true" if backup else "false",
+        )
+
+    def delete_lines(
+        self,
+        remote_path: str,
+        start: int,
+        end: int,
+        *,
+        backup: bool = True,
+        expected_sha256: str | None = None,
+    ) -> dict[str, Any]:
+        result = self.replace_lines(
+            remote_path, start, end, "",
+            backup=backup, expected_sha256=expected_sha256,
+        )
+        result["deleted_lines"] = result.pop("replaced_lines", 0)
+        return result
+
+    def search_in_file(
+        self,
+        remote_path: str,
+        pattern: str,
+        *,
+        context: int = 2,
+        max_matches: int = 20,
+    ) -> dict[str, Any]:
+        return run_remote_python_json(
+            self,
+            REMOTE_FILE_SEARCH_SCRIPT,
+            remote_path,
+            pattern,
+            context,
+            max_matches,
+        )
 
 
 def run_remote_python_json(bridge: McpBridge, script: str, *args: object, cwd: str | None = None) -> dict[str, Any]:

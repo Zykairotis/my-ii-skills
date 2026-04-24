@@ -1,6 +1,6 @@
 ---
 name: ssh-pc
-description: Bridge a hosted agent to Parth's PC over MCP SSH Manager via Pinggy. Use when work must run against the PC's shell or filesystem, especially when the agent needs to pull files into its own workspace, edit locally, and push them back atomically.
+description: Bridge a hosted agent to Parth's PC over MCP SSH Manager via Pinggy. Use when work must run against the PC's shell or filesystem. Supports line-level reads and surgical edits (1 round trip), or full-file pull/edit/push for large refactors.
 ---
 
 # SSH PC
@@ -27,6 +27,8 @@ Do not rely on MCP `ssh_download` or `ssh_upload` for hosted-agent round trips u
 Use the bundled scripts instead. They bridge file contents through `ssh_execute` in bounded chunks.
 
 Do not dump full file contents with raw `ssh_execute`, `remote_exec.py`, `cat`, or `base64`. Large stdout payloads can be truncated somewhere in the MCP, tunnel, or client chain. That failure can look like a normal successful read unless you chunk the transfer and verify the final checksum.
+
+For reading small portions or making surgical edits, use `remote_read.py` and `remote_edit.py` instead of the full pull/edit/push cycle. These produce small, structured JSON outputs — safe from truncation.
 
 ## First steps
 
@@ -58,6 +60,108 @@ Use this for:
 - tiny edits only
 
 Do not use it to transfer full file contents.
+
+### `scripts/remote_read.py`
+
+Read content from a remote file. By default it shows line numbers and metadata. Use `--json` for structured output or `--bare` for raw text only.
+
+```bash
+# Read specific line range (lightweight, 1 round trip)
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --start 40 --end 60
+
+# Search for a pattern with context
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --search "function\s+parseConfig" \
+  --context 3
+
+# Read entire file (falls back to chunked download)
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts
+
+# JSON output for programmatic use
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --start 40 --end 60 \
+  --json
+```
+
+Useful flags:
+
+```bash
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --start 100  # read from line 100 to end
+
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --end 50     # read first 50 lines
+
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --search "TODO" --context 2
+```
+
+### `scripts/remote_edit.py`
+
+Edit remote files with surgical line-level operations. Writes atomically with automatic backups. For edits > ~6KB, use pull/edit/push instead.
+
+```bash
+# Replace lines 45-47
+python3 scripts/remote_edit.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --action replace --start 45 --end 47 \
+  --content "const config = validate(input);\n  return config;"
+
+# Insert after line 42
+python3 scripts/remote_edit.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --action insert --at-line 42 --position after \
+  --content "  // New validation logic\n  validateOrThrow(config);"
+
+# Insert before line 1 (beginning of file)
+python3 scripts/remote_edit.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --action insert --at-line 0 --position before \
+  --content "#!/usr/bin/env node"
+
+# Delete lines 50-55
+python3 scripts/remote_edit.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --action delete --start 50 --end 55
+
+# Preview changes without applying
+python3 scripts/remote_edit.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --action replace --start 45 --end 47 \
+  --content "updated code" \
+  --dry-run
+
+# Read content from a local file
+python3 scripts/remote_edit.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --action replace --start 1 --end 0 \
+  --file /tmp/new_version.ts
+```
+
+Useful flags:
+
+```bash
+# Skip backup
+python3 scripts/remote_edit.py ... --no-backup
+
+# Force skip SHA256 verification
+python3 scripts/remote_edit.py ... --force
+
+# Verify file hasn't changed since last read
+python3 scripts/remote_edit.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --action replace --start 45 --end 47 \
+  --content "updated code" \
+  --expected-sha256 "abc123..."
+```
 
 ### `scripts/pull_remote_file.py`
 
@@ -110,6 +214,36 @@ If you are writing custom Python around the bridge, use these methods instead of
 from mcp_bridge import McpBridge
 
 bridge = McpBridge(base_url="https://example.run.pinggy.link")
+
+# Read specific lines (lightweight)
+ctx = bridge.read_lines("/mnt/wsl/fastssd/myproject/app.ts", start=40, end=60)
+for line in ctx["lines"]:
+    print(f"{line['num']:4d} | {line['text']}")
+
+# Search for a pattern
+matches = bridge.search_in_file(
+    "/mnt/wsl/fastssd/myproject/app.ts",
+    pattern=r"function\s+\w+Config",
+    context=2,
+)
+
+# Replace lines atomically
+bridge.replace_lines(
+    "/mnt/wsl/fastssd/myproject/app.ts",
+    start=45, end=47,
+    new_text="const config = validate(input);\n  return config;",
+    expected_sha256=ctx["sha256"],
+)
+
+# Insert after a line
+bridge.insert_lines(
+    "/mnt/wsl/fastssd/myproject/app.ts",
+    at_line=42,
+    new_text="// New validation logic\nvalidateOrThrow(config);",
+    position="after",
+)
+
+# Full-file operations (chunked transfer)
 content = bridge.read_remote_text_file("/mnt/wsl/fastssd/myproject/app.ts")
 bridge.upload_remote_file_atomic(
     "/workspace/app.ts",
@@ -139,9 +273,31 @@ python3 scripts/push_remote_file.py \
   --no-backup
 ```
 
+## Quick edits (line-level, 1 round trip)
+
+For surgical changes to a few lines, skip the full pull/edit/push cycle:
+
+```bash
+# Read context
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --start 40 --end 60
+
+# Edit a few lines
+python3 scripts/remote_edit.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --action replace --start 45 --end 47 \
+  --content "const config = validate(input);\n  return config;"
+
+# Verify
+python3 scripts/remote_read.py \
+  --remote-path /mnt/wsl/fastssd/myproject/src/app.ts \
+  --start 40 --end 50
+```
+
 ## Default workflow for real edits
 
-For any non-trivial file change, use this exact sequence:
+For large refactors, multi-section changes, or edits > ~50 lines, use the full round-trip:
 
 1. Inspect:
 
@@ -176,9 +332,13 @@ python3 scripts/remote_exec.py \
 
 ## When to choose which path
 
-- Use direct remote commands for inspection and tiny one-line changes.
-- Use pull/edit/push for multi-line edits, formatted code, generated files, structured configs, or anything where local tooling is safer.
-- Use tmux for long-running processes or servers.
+| Scenario | Tool |
+|---|---|
+| Read a line range or search | `remote_read.py` |
+| Edit up to ~50 lines surgically | `remote_edit.py` |
+| Inspect, git, tests, tmux | `remote_exec.py` |
+| Large refactor, generated file, > 50 lines changed | `pull_remote_file.py` + edit + `push_remote_file.py` |
+| Replace an entire small file atomically | `remote_edit.py --action replace --start 1 --end 0 --file /tmp/new.ts` |
 
 ## Remote skills on the PC
 
